@@ -390,6 +390,8 @@ class ActiveTask:
                                         type(event).__name__,
                                     )
 
+                                is_first_event = not self._task_created.is_set()
+
                                 if isinstance(event, Task):
                                     existing_task = (
                                         await self._task_manager.get_task()
@@ -432,6 +434,27 @@ class ActiveTask:
 
                                 self._task_manager.context_id = event.context_id
                                 if not isinstance(event, Task):
+                                    # Emit initial Task(SUBMITTED) to subscribers
+                                    # before the first state-change event is processed,
+                                    # so clients see the task created in SUBMITTED state.
+                                    if is_first_event:
+                                        initial_task = (
+                                            await self._task_manager.get_task()
+                                        )
+                                        if initial_task is not None:
+                                            initial_task_copy = Task()
+                                            initial_task_copy.CopyFrom(
+                                                initial_task
+                                            )
+                                            await self._event_queue_subscribers.enqueue_event(
+                                                cast(
+                                                    'Any',
+                                                    (
+                                                        initial_task_copy,
+                                                        initial_task_copy,
+                                                    ),
+                                                )
+                                            )
                                     await self._task_manager.process(event)
 
                                 self._task_created.set()
