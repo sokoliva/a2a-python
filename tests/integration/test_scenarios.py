@@ -1250,9 +1250,15 @@ async def test_scenario_auth_required_side_channel(use_legacy, streaming):
 
         side_channel_event.set()
 
-        # Remaining event.
-        (event3,) = [event async for event in it]
-        assert get_state(event3) == TaskState.TASK_STATE_COMPLETED
+        if use_legacy:
+            # Legacy: AUTH_REQUIRED closes the event queue, so no further events
+            # are emitted. The agent cannot enqueue COMPLETED after the queue closes.
+            remaining = [event async for event in it]
+            assert remaining == []
+        else:
+            # Remaining event.
+            (event3,) = [event async for event in it]
+            assert get_state(event3) == TaskState.TASK_STATE_COMPLETED
     else:
         (event,) = [event async for event in it]
         assert get_state(event) == TaskState.TASK_STATE_AUTH_REQUIRED
@@ -1260,9 +1266,20 @@ async def test_scenario_auth_required_side_channel(use_legacy, streaming):
 
         side_channel_event.set()
 
-        await wait_for_state(
-            client, task_id, expected_states={TaskState.TASK_STATE_COMPLETED}
-        )
+        if use_legacy:
+            # Legacy: AUTH_REQUIRED closes the event queue; the agent cannot enqueue
+            # COMPLETED, so the task remains in AUTH_REQUIRED.
+            await wait_for_state(
+                client,
+                task_id,
+                expected_states={TaskState.TASK_STATE_AUTH_REQUIRED},
+            )
+        else:
+            await wait_for_state(
+                client,
+                task_id,
+                expected_states={TaskState.TASK_STATE_COMPLETED},
+            )
 
 
 # Scenario: Parallel subscribe attach detach
