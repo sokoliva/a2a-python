@@ -1745,3 +1745,194 @@ async def test_scenario_enqueue_task_twice(caplog, use_legacy, streaming):
             and 'Ignoring task replacement' in record.message
         ]
         assert len(error_logs) == 1
+
+
+# Scenario: Stream does not stop on interrupted state unless the agent returns
+@pytest.mark.timeout(2.0)
+@pytest.mark.asyncio
+async def test_scenario_stream_does_not_stop_on_interrupted_state_without_agent_returning():
+    """Prove that on_message_send_stream does NOT close the stream when the agent
+    publishes an interrupted state (AUTH_REQUIRED, out-of-bound model) without
+    returning from execute().
+
+    For on_message_send (non-streaming), the framework itself breaks the response
+    loop when it sees an interrupted state. For on_message_send_stream there is no
+    such mechanism — the stream stays open until execute() returns (signalled
+    internally via _RequestCompleted). Closing the stream is therefore entirely the
+    agent executor's responsibility.
+
+    Test structure:
+      1. Agent publishes AUTH_REQUIRED and then blocks (simulating out-of-band auth).
+      2. Stream yields AUTH_REQUIRED.
+      3. A background task starts consuming the next event from the stream.
+         If the stream had closed at AUTH_REQUIRED, that task would complete quickly.
+      4. We wait briefly and assert the background task is still pending — the stream
+         is open and waiting for the agent to resume.
+      5. We unblock the agent (out-of-band auth completes); it publishes COMPLETED
+         and returns from execute().
+      6. The background task now receives COMPLETED, proving the stream only ended
+         because the agent returned.
+    """
+    auth_completed = asyncio.Event()
+
+    class OutOfBoundAuthAgent(AgentExecutor):
+        async def execute(
+            self, context: RequestContext, event_queue: EventQueue
+        ):
+            await event_queue.enqueue_event(
+                TaskStatusUpdateEvent(
+                    task_id=context.task_id,
+                    context_id=context.context_id,
+                    status=TaskStatus(state=TaskState.TASK_STATE_AUTH_REQUIRED),
+                )
+            )
+            # Out-of-bound: do NOT return from execute(); block until external
+            # auth provider signals completion.
+            await auth_completed.wait()
+            await event_queue.enqueue_event(
+                TaskStatusUpdateEvent(
+                    task_id=context.task_id,
+                    context_id=context.context_id,
+                    status=TaskStatus(state=TaskState.TASK_STATE_COMPLETED),
+                )
+            )
+
+        async def cancel(
+            self, context: RequestContext, event_queue: EventQueue
+        ):
+            auth_completed.set()
+
+    # Only DefaultRequestHandlerV2: the legacy handler uses a different streaming
+    # path (EventConsumer / ResultAggregator) and its behaviour is already covered
+    # by test_scenario_auth_required_side_channel.
+    handler = create_handler(OutOfBoundAuthAgent(), use_legacy=False)
+    client = await create_client(
+        handler, agent_card=agent_card(), streaming=True
+    )
+
+    stream = client.send_message(
+        SendMessageRequest(
+            message=Message(
+                message_id='test-msg',
+                role=Role.ROLE_USER,
+                parts=[Part(text='start')],
+            ),
+            configuration=SendMessageConfiguration(return_immediately=False),
+        )
+    )
+
+    # Step 2: stream yields AUTH_REQUIRED (agent published it before blocking).
+    event1 = await asyncio.wait_for(stream.__anext__(), timeout=1.0)
+    assert get_state(event1) == TaskState.TASK_STATE_AUTH_REQUIRED
+
+    # Step 3: start consuming the next event in the background.
+    next_event_task = asyncio.create_task(stream.__anext__())
+
+    # Step 4: give the event loop a moment to run — if the stream had closed at
+    # AUTH_REQUIRED the task would already be done (StopAsyncIteration).
+    await asyncio.sleep(0.1)
+    assert not next_event_task.done(), (
+        'Stream closed after AUTH_REQUIRED even though the agent did not return '
+        'from execute(). on_message_send_stream must stay open until the agent '
+        'executor returns from execute().'
+    )
+
+    # Step 5 & 6: signal out-of-band auth completion; agent publishes COMPLETED
+    # and returns. The background task should now receive that event.
+    auth_completed.set()
+    event2 = await asyncio.wait_for(next_event_task, timeout=1.0)
+    assert get_state(event2) == TaskState.TASK_STATE_COMPLETED
+
+
+# Scenario: Stream does not stop on INPUT_REQUIRED unless the agent returns
+@pytest.mark.timeout(2.0)
+@pytest.mark.asyncio
+async def test_scenario_stream_does_not_stop_on_input_required_without_agent_returning():
+    """Prove that on_message_send_stream does NOT close the stream when the agent
+    publishes TASK_STATE_INPUT_REQUIRED without returning from execute().
+
+    The docstring contract says the agent SHOULD return after INPUT_REQUIRED so
+    the framework can re-invoke execute() when the user replies. This test shows
+    what happens if that contract is violated (or in a hypothetical variant where
+    the agent decides to keep running): the stream stays open regardless, because
+    on_message_send_stream has no special handling for INPUT_REQUIRED — only the
+    agent returning from execute() closes the stream.
+
+    Test structure mirrors test_scenario_stream_does_not_stop_on_interrupted_state_without_agent_returning:
+      1. Agent publishes INPUT_REQUIRED and then blocks (does not return).
+      2. Stream yields INPUT_REQUIRED.
+      3. A background task starts consuming the next event.
+         If the stream had auto-closed at INPUT_REQUIRED that task would finish quickly.
+      4. We wait briefly and assert the background task is still pending.
+      5. We unblock the agent; it publishes COMPLETED and returns from execute().
+      6. The background task receives COMPLETED, proving the stream only ended
+         because the agent returned — not because of the INPUT_REQUIRED state.
+    """
+    input_provided = asyncio.Event()
+
+    class BlockingInputRequiredAgent(AgentExecutor):
+        async def execute(
+            self, context: RequestContext, event_queue: EventQueue
+        ):
+            await event_queue.enqueue_event(
+                TaskStatusUpdateEvent(
+                    task_id=context.task_id,
+                    context_id=context.context_id,
+                    status=TaskStatus(
+                        state=TaskState.TASK_STATE_CANCELED
+                    ),
+                )
+            )
+            # Intentionally do NOT return from execute() to prove the stream
+            # stays open regardless of the INPUT_REQUIRED state.
+            await input_provided.wait()
+            await event_queue.enqueue_event(
+                TaskStatusUpdateEvent(
+                    task_id=context.task_id,
+                    context_id=context.context_id,
+                    status=TaskStatus(state=TaskState.TASK_STATE_COMPLETED),
+                )
+            )
+
+        async def cancel(
+            self, context: RequestContext, event_queue: EventQueue
+        ):
+            input_provided.set()
+
+    handler = create_handler(BlockingInputRequiredAgent(), use_legacy=False)
+    client = await create_client(
+        handler, agent_card=agent_card(), streaming=True
+    )
+
+    stream = client.send_message(
+        SendMessageRequest(
+            message=Message(
+                message_id='test-msg',
+                role=Role.ROLE_USER,
+                parts=[Part(text='start')],
+            ),
+            configuration=SendMessageConfiguration(return_immediately=False),
+        )
+    )
+
+    # Step 2: stream yields TASK_STATE_CANCELED.
+    event1 = await asyncio.wait_for(stream.__anext__(), timeout=1.0)
+    assert get_state(event1) == TaskState.TASK_STATE_CANCELED
+
+    # Step 3: start consuming the next event in the background.
+    next_event_task = asyncio.create_task(stream.__anext__())
+
+    # Step 4: give the event loop a moment to run — if the stream had auto-closed
+    # at INPUT_REQUIRED the task would already be done (StopAsyncIteration).
+    await asyncio.sleep(0.1)
+    assert not next_event_task.done(), (
+        'Stream closed after INPUT_REQUIRED even though the agent did not return '
+        'from execute(). on_message_send_stream must stay open until the agent '
+        'executor returns from execute().'
+    )
+
+    # Step 5 & 6: unblock the agent; it publishes COMPLETED and returns.
+    # The background task should now receive that final event.
+    input_provided.set()
+    event2 = await asyncio.wait_for(next_event_task, timeout=1.0)
+    assert get_state(event2) == TaskState.TASK_STATE_COMPLETED
