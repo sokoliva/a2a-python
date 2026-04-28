@@ -1,6 +1,5 @@
 """Tests for a2a.server.models module."""
 
-
 from a2a.server.models import (
     create_push_notification_config_model,
     create_task_model,

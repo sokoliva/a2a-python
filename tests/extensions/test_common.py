@@ -1,4 +1,3 @@
-
 from a2a.extensions.common import (
     find_extension_by_uri,
     get_requested_extensions,

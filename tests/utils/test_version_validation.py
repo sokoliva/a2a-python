@@ -1,6 +1,5 @@
 """Tests for version validation decorators."""
 
-
 import pytest
 
 from a2a.server.context import ServerCallContext
